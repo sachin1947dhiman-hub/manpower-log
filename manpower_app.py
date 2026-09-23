@@ -28,10 +28,14 @@ def login():
     if st.session_state.get("logged_in"):
         return True
     st.title("👷 Manpower Log")
+    name = st.text_input("Your name")
     pw = st.text_input("Enter password", type="password")
     if st.button("Login", type="primary", use_container_width=True):
-        if pw == st.secrets["APP_PASSWORD"]:
+        if not name.strip():
+            st.error("Please enter your name")
+        elif pw == st.secrets["APP_PASSWORD"]:
             st.session_state["logged_in"] = True
+            st.session_state["user_name"] = name.strip()
             st.rerun()
         else:
             st.error("Wrong password")
@@ -100,13 +104,15 @@ def same(a, b):
 # ------------------------------------------------------------
 def make_excel(df):
     df = add_calc(df)
+    if "entered_by" not in df.columns:
+        df["entered_by"] = None
     nice = df.rename(columns={
         "entry_date": "Date", "task": "Task", "manpower": "Manpower",
         "hours": "Hours", "man_hours": "Man-Hours", "output_qty": "Output Qty",
         "output_unit": "Unit", "output_per_man_hour": "Output per Man-Hour",
-        "remarks": "Remarks",
+        "remarks": "Remarks", "entered_by": "Entered By",
     })[["Date", "Task", "Manpower", "Hours", "Man-Hours", "Output Qty",
-        "Unit", "Output per Man-Hour", "Remarks"]]
+        "Unit", "Output per Man-Hour", "Remarks", "Entered By"]]
 
     daily = df.groupby("entry_date").agg(
         Tasks=("task", "count"),
@@ -149,6 +155,11 @@ def make_excel(df):
 # SCREENS
 # ------------------------------------------------------------
 st.title("👷 Manpower Log")
+c_user, c_out = st.columns([3, 1])
+c_user.caption(f"👤 Logged in as **{st.session_state['user_name']}**")
+if c_out.button("Logout"):
+    st.session_state.clear()
+    st.rerun()
 tab1, tab2, tab3 = st.tabs(["➕ New Entry", "✏️ View & Edit", "📥 Excel"])
 
 # ---------------- TAB 1: NEW ENTRY ----------------
@@ -200,6 +211,7 @@ with tab1:
                 "output_qty": float(qty),
                 "output_unit": unit,
                 "remarks": remarks.strip() or None,
+                "entered_by": st.session_state["user_name"],
             })
 
     if st.button("💾 Save all", type="primary", use_container_width=True):
@@ -236,7 +248,9 @@ with tab2:
     else:
         fields = ["entry_date", "task", "manpower", "hours",
                   "output_qty", "output_unit", "remarks"]
-        view = df[["id"] + fields].copy()
+        if "entered_by" not in df.columns:
+            df["entered_by"] = None
+        view = df[["id"] + fields + ["entered_by"]].copy()
         view["delete"] = False
         st.caption("Tap a cell to change it. Tick 'Delete?' to remove a row. "
                    "Then press Save changes.")
@@ -252,6 +266,7 @@ with tab2:
                 "output_qty": st.column_config.NumberColumn("Output", min_value=0),
                 "output_unit": st.column_config.SelectboxColumn("Unit", options=UNITS),
                 "remarks": st.column_config.TextColumn("Remarks"),
+                "entered_by": st.column_config.TextColumn("Entered By", disabled=True),
                 "delete": st.column_config.CheckboxColumn("Delete?"),
             },
         )
