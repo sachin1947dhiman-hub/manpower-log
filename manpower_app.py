@@ -1,5 +1,5 @@
 import io
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -7,12 +7,28 @@ import streamlit as st
 from supabase import create_client
 
 # ------------------------------------------------------------
-# SETTINGS  (you can edit these lists any time)
+# SETTINGS  (edit these lists any time)
 # ------------------------------------------------------------
-TABLE = "manpower_log"
-TASKS = ["Combo", "Peanut Line", "Pouch Open", "Packing",
-         "Export Stickering", "Line", "Other"]
-UNITS = ["Pouch", "Case", "Kg", "Box", "Carton", "Nos"]
+PART1_STATIONS = ["Dispatch", "Store", "Lab", "Nachos Line", "Peanut Line",
+                  "Potato Line", "ETP", "Miscellaneous", "Other"]
+PART2_STATIONS = ["Combo", "Tray", "Can", "Pouch Open", "Stickering",
+                  "Leakage Check", "Other"]
+DEFAULT_UNIT = {"Combo": "Pouch", "Tray": "Tray", "Can": "Can",
+                "Pouch Open": "Pouch", "Stickering": "Nos",
+                "Leakage Check": "Pouch", "Other": "Nos"}
+UNITS = ["Pouch", "Case", "Kg", "Box", "Tray", "Can", "Nos"]
+SHIFTS = ["Day", "Night"]
+
+# worker types: (database column, label on screen, shift hours)
+TYPES = [("ladies_10", "Ladies 10h", 10),
+         ("ladies_12", "Ladies 12h", 12),
+         ("gents_12", "Gents 12h", 12)]
+COLS = [t[0] for t in TYPES]
+LABELS = [t[1] for t in TYPES]
+HOURS = {t[0]: t[2] for t in TYPES}
+
+T_ATT = "mp_attendance"
+T_ALLOC = "mp_allocation"
 
 st.set_page_config(page_title="Manpower Log", page_icon="👷", layout="centered")
 
@@ -22,7 +38,7 @@ def today_ist():
 
 
 # ------------------------------------------------------------
-# PASSWORD
+# LOGIN
 # ------------------------------------------------------------
 def login():
     if st.session_state.get("logged_in"):
@@ -30,9 +46,9 @@ def login():
     st.title("👷 Manpower Log")
     name = st.text_input("Your name")
     pw = st.text_input("Enter password", type="password")
-    if st.button("Login", type="primary", use_container_width=True):
+    if st.button("Login", type="primary", width="stretch"):
         if not name.strip():
-            st.error("Please enter your name")
+            st.error("Enter your name")
         elif pw == st.secrets["APP_PASSWORD"]:
             st.session_state["logged_in"] = True
             st.session_state["user_name"] = name.strip()
@@ -57,102 +73,156 @@ def get_db():
 db = get_db()
 
 
-def fetch(start, end):
-    """Read all rows between two dates."""
+def load_sheet(d, shift):
+    att = (db.table(T_ATT).select("*")
+           .eq("entry_date", d.isoformat()).eq("shift", shift)
+           .execute().data)
+    alloc = (db.table(T_ALLOC).select("*")
+             .eq("entry_date", d.isoformat()).eq("shift", shift)
+             .order("id").execute().data)
+    return (att[0] if att else None), pd.DataFrame(alloc)
+
+
+def fetch_range(table, start, end):
     rows, step, offset = [], 1000, 0
     while True:
-        res = (db.table(TABLE).select("*")
+        res = (db.table(table).select("*")
                .gte("entry_date", start.isoformat())
                .lte("entry_date", end.isoformat())
                .order("entry_date").order("id")
-               .range(offset, offset + step - 1)
-               .execute())
+               .range(offset, offset + step - 1).execute())
         rows.extend(res.data)
         if len(res.data) < step:
             break
         offset += step
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df["entry_date"] = pd.to_datetime(df["entry_date"]).dt.date
-    for c in ["manpower", "hours", "output_qty"]:
-        df[c] = pd.to_numeric(df[c])
+    if not df.empty:
+        df["entry_date"] = pd.to_datetime(df["entry_date"]).dt.date
     return df
 
 
-def add_calc(df):
-    df = df.copy()
-    df["man_hours"] = df["manpower"] * df["hours"]
-    df["output_per_man_hour"] = (
-        df["output_qty"] / df["man_hours"].where(df["man_hours"] > 0)
-    ).round(2)
+# ------------------------------------------------------------
+# CALCULATIONS
+# ------------------------------------------------------------
+def to_num(df, cols):
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     return df
 
 
-def clean(v):
-    return None if pd.isna(v) else v
+def people(df):
+    return df[COLS].sum(axis=1)
 
 
-def same(a, b):
-    if pd.isna(a) and pd.isna(b):
-        return True
-    return a == b
+def mh_part1(df):
+    """Full shift: each type x its own shift hours."""
+    return sum(df[c] * HOURS[c] for c in COLS)
+
+
+def mh_part2(df):
+    """People x hours entered."""
+    return people(df) * df["hours"]
 
 
 # ------------------------------------------------------------
 # EXCEL
 # ------------------------------------------------------------
-def make_excel(df):
-    df = add_calc(df)
-    if "entered_by" not in df.columns:
-        df["entered_by"] = None
-    nice = df.rename(columns={
-        "entry_date": "Date", "task": "Task", "manpower": "Manpower",
-        "hours": "Hours", "man_hours": "Man-Hours", "output_qty": "Output Qty",
-        "output_unit": "Unit", "output_per_man_hour": "Output per Man-Hour",
-        "remarks": "Remarks", "entered_by": "Entered By",
-    })[["Date", "Task", "Manpower", "Hours", "Man-Hours", "Output Qty",
-        "Unit", "Output per Man-Hour", "Remarks", "Entered By"]]
+def make_excel(att, alloc):
+    att = to_num(att.copy(), COLS)
+    att["Total Present"] = people(att)
+    att["Available Man-Hours"] = mh_part1(att)
 
-    daily = df.groupby("entry_date").agg(
-        Tasks=("task", "count"),
-        Total_Manpower=("manpower", "sum"),
-        Total_Man_Hours=("man_hours", "sum"),
-    ).reset_index()
-    daily.columns = ["Date", "Tasks", "Total Manpower", "Total Man-Hours"]
+    alloc = to_num(alloc.copy(), COLS + ["hours", "output_qty"])
+    alloc["people"] = people(alloc)
+    alloc["man_hours"] = 0.0
+    p1 = alloc["part"] == 1
+    alloc.loc[p1, "man_hours"] = mh_part1(alloc[p1])
+    alloc.loc[~p1, "man_hours"] = mh_part2(alloc[~p1])
 
-    task_sum = df.groupby(["task", "output_unit"], dropna=False).agg(
-        Days=("entry_date", "nunique"),
-        Total_Manpower=("manpower", "sum"),
-        Man_Hours=("man_hours", "sum"),
-        Output=("output_qty", "sum"),
-    ).reset_index()
-    task_sum["Output per Man-Hour"] = (
-        task_sum["Output"] / task_sum["Man_Hours"].where(task_sum["Man_Hours"] > 0)
-    ).round(2)
-    task_sum.columns = ["Task", "Unit", "Days", "Total Manpower",
-                        "Total Man-Hours", "Total Output", "Output per Man-Hour"]
+    by = alloc.pivot_table(index=["entry_date", "shift"], columns="part",
+                           values="man_hours", aggfunc="sum", fill_value=0)
+    by = by.rename(columns={1: "Part 1 Man-Hours", 2: "Part 2 Man-Hours"})
+    for c in ["Part 1 Man-Hours", "Part 2 Man-Hours"]:
+        if c not in by.columns:
+            by[c] = 0.0
+    daily = att.merge(by.reset_index(), on=["entry_date", "shift"], how="left")
+    daily[["Part 1 Man-Hours", "Part 2 Man-Hours"]] = \
+        daily[["Part 1 Man-Hours", "Part 2 Man-Hours"]].fillna(0)
+    daily["Not Allocated Man-Hours"] = (daily["Available Man-Hours"]
+                                        - daily["Part 1 Man-Hours"]
+                                        - daily["Part 2 Man-Hours"])
+    daily = daily.rename(columns={"entry_date": "Date", "shift": "Shift",
+                                  "entered_by": "Saved By",
+                                  **dict(zip(COLS, LABELS))})
+    daily = daily[["Date", "Shift"] + LABELS +
+                  ["Total Present", "Available Man-Hours", "Part 1 Man-Hours",
+                   "Part 2 Man-Hours", "Not Allocated Man-Hours", "Saved By"]]
+
+    base = {"entry_date": "Date", "shift": "Shift", "station": "Station",
+            "people": "Total People", "man_hours": "Man-Hours",
+            **dict(zip(COLS, LABELS))}
+    part1 = alloc[p1].rename(columns=base)[
+        ["Date", "Shift", "Station"] + LABELS + ["Total People", "Man-Hours"]]
+
+    part2 = alloc[~p1].copy()
+    part2["out_per_mh"] = (part2["output_qty"] /
+                           part2["man_hours"].where(part2["man_hours"] > 0)).round(2)
+    part2 = part2.rename(columns={**base, "hours": "Hours",
+                                  "output_qty": "Output", "output_unit": "Unit",
+                                  "out_per_mh": "Output per Man-Hour",
+                                  "remarks": "Remarks"})[
+        ["Date", "Shift", "Station"] + LABELS +
+        ["Total People", "Hours", "Man-Hours", "Output", "Unit",
+         "Output per Man-Hour", "Remarks"]]
+
+    summ = alloc.copy()
+    summ["Part"] = summ["part"].map({1: "Part 1", 2: "Part 2"})
+    summ["output_unit"] = summ["output_unit"].fillna("")
+    summ = summ.groupby(["Part", "station", "output_unit"]).agg(
+        Days=("entry_date", "nunique"), Man_Hours=("man_hours", "sum"),
+        Output=("output_qty", "sum")).reset_index()
+    summ["Output per Man-Hour"] = (summ["Output"] /
+                                   summ["Man_Hours"].where(summ["Man_Hours"] > 0)).round(2)
+    summ.loc[summ["Part"] == "Part 1", ["Output", "Output per Man-Hour"]] = None
+    summ.columns = ["Part", "Station", "Unit", "Days", "Total Man-Hours",
+                    "Total Output", "Output per Man-Hour"]
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl", date_format="DD-MM-YYYY") as xw:
-        daily.to_excel(xw, sheet_name="Date Summary", index=False)
-        task_sum.to_excel(xw, sheet_name="Task Summary", index=False)
-        nice.to_excel(xw, sheet_name="All Data", index=False)
-        # one sheet per date (only if 60 days or less)
-        if nice["Date"].nunique() <= 60:
-            for d, g in nice.groupby("Date"):
-                g.to_excel(xw, sheet_name=d.strftime("%d-%m-%Y"), index=False)
+        daily.to_excel(xw, sheet_name="Daily Summary", index=False)
+        part1.to_excel(xw, sheet_name="Part 1 Stations", index=False)
+        part2.to_excel(xw, sheet_name="Part 2 Manual", index=False)
+        summ.to_excel(xw, sheet_name="Station Summary", index=False)
+
+        # one sheet per date (if 31 days or less)
+        if daily["Date"].nunique() <= 31:
+            for d in sorted(daily["Date"].unique()):
+                name = d.strftime("%d-%m-%Y")
+                row = 0
+                for title, df in [("Attendance and balance", daily),
+                                  ("Part 1 - Stations", part1),
+                                  ("Part 2 - Manual work", part2)]:
+                    part = df[df["Date"] == d]
+                    if name in xw.book.sheetnames:
+                        xw.book[name].cell(row=row + 1, column=1, value=title)
+                    else:
+                        pd.DataFrame().to_excel(xw, sheet_name=name)
+                        xw.book[name].cell(row=row + 1, column=1, value=title)
+                    part.to_excel(xw, sheet_name=name, index=False, startrow=row + 1)
+                    row += len(part) + 4
+
         for ws in xw.book.worksheets:
             for col in ws.columns:
                 width = max(len(str(c.value)) if c.value is not None else 0
                             for c in col) + 2
                 ws.column_dimensions[col[0].column_letter].width = min(max(width, 10), 40)
-            ws.freeze_panes = "A2"
+            if not ws.title[0].isdigit():
+                ws.freeze_panes = "A2"
     return buf.getvalue()
 
 
 # ------------------------------------------------------------
-# SCREENS
+# SCREEN
 # ------------------------------------------------------------
 st.title("👷 Manpower Log")
 c_user, c_out = st.columns([3, 1])
@@ -160,170 +230,229 @@ c_user.caption(f"👤 Logged in as **{st.session_state['user_name']}**")
 if c_out.button("Logout"):
     st.session_state.clear()
     st.rerun()
-tab1, tab2, tab3 = st.tabs(["➕ New Entry", "✏️ View & Edit", "📥 Excel"])
 
-# ---------------- TAB 1: NEW ENTRY ----------------
+tab1, tab2 = st.tabs(["📝 Daily Sheet", "📥 Excel"])
+
+# ================= TAB 1: DAILY SHEET =================
 with tab1:
-    st.session_state.setdefault("form_id", 0)
-    fid = st.session_state["form_id"]
-    msg = st.session_state.pop("entry_msg", None)
-    if msg:
-        st.success(msg)
-
-    entry_date = st.date_input("Date", value=today_ist(),
-                               format="DD/MM/YYYY", key=f"date_{fid}")
-    n = st.number_input("How many tasks on this date?", min_value=1,
-                        max_value=20, value=1, step=1, key=f"n_{fid}")
-
-    records, errors = [], []
-    for i in range(int(n)):
-        with st.container(border=True):
-            st.markdown(f"**Task {i + 1}**")
-            task = st.selectbox("Task", TASKS, key=f"task_{fid}_{i}")
-            if task == "Other":
-                task = st.text_input("Write task name",
-                                     key=f"other_{fid}_{i}").strip()
-            c1, c2 = st.columns(2)
-            mp = c1.number_input("Manpower", min_value=0, step=1,
-                                 key=f"mp_{fid}_{i}")
-            hrs = c2.number_input("Hours", min_value=0.0, step=0.5,
-                                  key=f"hrs_{fid}_{i}")
-            c3, c4 = st.columns(2)
-            qty = c3.number_input("Output qty", min_value=0.0, step=1.0,
-                                  key=f"qty_{fid}_{i}")
-            unit = c4.selectbox("Unit", UNITS, key=f"unit_{fid}_{i}")
-            remarks = st.text_input("Remarks (optional)", key=f"rem_{fid}_{i}")
-            if mp and hrs:
-                st.caption(f"Man-hours: {mp * hrs:g}")
-
-            if not task:
-                errors.append(f"Task {i + 1}: write the task name")
-            if mp <= 0:
-                errors.append(f"Task {i + 1}: manpower must be more than 0")
-            if hrs <= 0:
-                errors.append(f"Task {i + 1}: hours must be more than 0")
-
-            records.append({
-                "entry_date": entry_date.isoformat(),
-                "task": task,
-                "manpower": int(mp),
-                "hours": float(hrs),
-                "output_qty": float(qty),
-                "output_unit": unit,
-                "remarks": remarks.strip() or None,
-                "entered_by": st.session_state["user_name"],
-            })
-
-    if st.button("💾 Save all", type="primary", use_container_width=True):
-        if errors:
-            for e in errors:
-                st.error(e)
-        else:
-            try:
-                db.table(TABLE).insert(records).execute()
-            except Exception as e:
-                st.error(f"Could not save: {e}")
-            else:
-                st.session_state["entry_msg"] = (
-                    f"✅ Saved {len(records)} task(s) for "
-                    f"{entry_date.strftime('%d-%m-%Y')}")
-                st.session_state["form_id"] += 1
-                st.rerun()
-
-# ---------------- TAB 2: VIEW & EDIT ----------------
-with tab2:
-    st.session_state.setdefault("edit_ver", 0)
-    msg = st.session_state.pop("edit_msg", None)
+    msg = st.session_state.pop("save_msg", None)
     if msg:
         st.success(msg)
 
     c1, c2 = st.columns(2)
-    v_from = c1.date_input("From", today_ist() - timedelta(days=7),
-                           format="DD/MM/YYYY", key="v_from")
-    v_to = c2.date_input("To", today_ist(), format="DD/MM/YYYY", key="v_to")
+    sel_date = c1.date_input("Date", value=today_ist(), format="DD/MM/YYYY")
+    sel_shift = c2.selectbox("Shift", SHIFTS)
 
-    df = fetch(v_from, v_to)
-    if df.empty:
-        st.info("No entries in this period.")
+    st.session_state.setdefault("ver", 0)
+    cache_key = (sel_date.isoformat(), sel_shift, st.session_state["ver"])
+    if st.session_state.get("cache_key") != cache_key:
+        try:
+            st.session_state["cache_data"] = load_sheet(sel_date, sel_shift)
+        except Exception as e:
+            st.error(f"Could not load data: {e}")
+            st.stop()
+        st.session_state["cache_key"] = cache_key
+    att, alloc = st.session_state["cache_data"]
+    k = "_".join(map(str, cache_key))  # widget key prefix
+
+    if att:
+        st.info(f"This sheet is already saved (last saved by {att.get('entered_by') or '-'}). "
+                "You can change it and save again.")
+
+    # ---------- STEP 1 : PRESENT ----------
+    st.subheader("Step 1 · Total present")
+    present = {}
+    pc = st.columns(3)
+    for i, (col, label, hrs) in enumerate(TYPES):
+        present[col] = pc[i].number_input(
+            f"{label}", min_value=0, step=1,
+            value=int(att[col]) if att else 0, key=f"pr_{col}_{k}")
+    avail_mh = sum(present[c] * HOURS[c] for c in COLS)
+    st.caption(f"Total present: **{sum(present.values())}** people · "
+               f"Available: **{avail_mh:g}** man-hours")
+
+    # ---------- STEP 2 : PART 1 ----------
+    st.subheader("Step 2 · Part 1 stations")
+    st.caption("Full shift at the station. Enter number of people only.")
+    p1 = pd.DataFrame({"Station": PART1_STATIONS})
+    for c, lab in zip(COLS, LABELS):
+        p1[lab] = 0
+    if not alloc.empty and (alloc["part"] == 1).any():
+        saved1 = alloc[alloc["part"] == 1]
+        for _, r in saved1.iterrows():
+            if r["station"] not in p1["Station"].values:
+                p1.loc[len(p1), "Station"] = r["station"]
+            idx = p1.index[p1["Station"] == r["station"]][0]
+            for c, lab in zip(COLS, LABELS):
+                p1.loc[idx, lab] = int(r[c] or 0)
+        p1[LABELS] = p1[LABELS].fillna(0).astype(int)
+
+    p1_edit = st.data_editor(
+        p1, hide_index=True, width="stretch", num_rows="fixed",
+        key=f"p1_{k}",
+        column_config={
+            "Station": st.column_config.TextColumn("Station", disabled=True),
+            **{lab: st.column_config.NumberColumn(lab, min_value=0, step=1, format="%d")
+               for lab in LABELS},
+        })
+    p1d = p1_edit.rename(columns=dict(zip(LABELS, COLS)))
+    p1d = to_num(p1d, COLS)
+    p1_mh = float(mh_part1(p1d).sum())
+    p1_tot = {c: int(p1d[c].sum()) for c in COLS}
+    st.caption("Part 1 people: " + " + ".join(str(p1_tot[c]) for c in COLS) +
+               f" = **{sum(p1_tot.values())}** · **{p1_mh:g}** man-hours")
+
+    # ---------- STEP 3 : PART 2 ----------
+    st.subheader("Step 3 · Part 2 manual work")
+    st.caption("People move between stations, so enter hours worked. "
+               "Use the + row at the bottom to add the same station again "
+               "with different hours.")
+    if not alloc.empty and (alloc["part"] == 2).any():
+        s2 = alloc[alloc["part"] == 2]
+        p2 = pd.DataFrame({
+            "Station": s2["station"],
+            **{lab: s2[c].fillna(0).astype(int) for c, lab in zip(COLS, LABELS)},
+            "Hours": pd.to_numeric(s2["hours"]).fillna(0).astype(float),
+            "Output": pd.to_numeric(s2["output_qty"]).fillna(0).astype(float),
+            "Unit": s2["output_unit"],
+            "Remarks": s2["remarks"].fillna(""),
+        }).reset_index(drop=True)
+        missing = [s for s in PART2_STATIONS if s not in p2["Station"].values]
     else:
-        fields = ["entry_date", "task", "manpower", "hours",
-                  "output_qty", "output_unit", "remarks"]
-        if "entered_by" not in df.columns:
-            df["entered_by"] = None
-        view = df[["id"] + fields + ["entered_by"]].copy()
-        view["delete"] = False
-        st.caption("Tap a cell to change it. Tick 'Delete?' to remove a row. "
-                   "Then press Save changes.")
-        edited = st.data_editor(
-            view, hide_index=True, use_container_width=True, num_rows="fixed",
-            key=f"editor_{st.session_state['edit_ver']}",
-            column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "entry_date": st.column_config.DateColumn("Date", format="DD-MM-YYYY"),
-                "task": st.column_config.TextColumn("Task"),
-                "manpower": st.column_config.NumberColumn("Manpower", min_value=0, step=1),
-                "hours": st.column_config.NumberColumn("Hours", min_value=0, step=0.5),
-                "output_qty": st.column_config.NumberColumn("Output", min_value=0),
-                "output_unit": st.column_config.SelectboxColumn("Unit", options=UNITS),
-                "remarks": st.column_config.TextColumn("Remarks"),
-                "entered_by": st.column_config.TextColumn("Entered By", disabled=True),
-                "delete": st.column_config.CheckboxColumn("Delete?"),
-            },
-        )
+        p2 = pd.DataFrame(columns=["Station"] + LABELS +
+                          ["Hours", "Output", "Unit", "Remarks"])
+        missing = PART2_STATIONS
+    if missing:
+        extra = pd.DataFrame({
+            "Station": missing, **{lab: 0 for lab in LABELS},
+            "Hours": 0.0, "Output": 0.0,
+            "Unit": [DEFAULT_UNIT.get(s, "Nos") for s in missing],
+            "Remarks": "",
+        })
+        p2 = pd.concat([p2, extra], ignore_index=True) if not p2.empty else extra
 
-        if st.button("💾 Save changes", type="primary", use_container_width=True):
-            orig = view.set_index("id")
-            to_delete = [int(x) for x in edited.loc[edited["delete"], "id"]]
-            updates, problems = [], []
-            for _, row in edited[~edited["delete"]].iterrows():
-                o = orig.loc[row["id"]]
-                if all(same(row[f], o[f]) for f in fields):
-                    continue
-                if pd.isna(row["entry_date"]) or not str(row["task"] or "").strip() \
-                        or pd.isna(row["manpower"]) or row["manpower"] <= 0 \
-                        or pd.isna(row["hours"]) or row["hours"] <= 0:
-                    problems.append(int(row["id"]))
-                    continue
-                updates.append((int(row["id"]), {
-                    "entry_date": row["entry_date"].isoformat(),
-                    "task": str(row["task"]).strip(),
-                    "manpower": int(row["manpower"]),
-                    "hours": float(row["hours"]),
-                    "output_qty": None if pd.isna(row["output_qty"]) else float(row["output_qty"]),
-                    "output_unit": clean(row["output_unit"]),
-                    "remarks": clean(row["remarks"]),
-                }))
-            if problems:
-                st.error(f"Check rows with ID {problems}: date, task, manpower "
-                         "and hours must be filled (more than 0). Nothing saved.")
+    p2_edit = st.data_editor(
+        p2, hide_index=True, width="stretch", num_rows="dynamic",
+        key=f"p2_{k}",
+        column_config={
+            "Station": st.column_config.SelectboxColumn(
+                "Station", options=PART2_STATIONS, required=True, pinned=True),
+            **{lab: st.column_config.NumberColumn(lab, min_value=0, step=1, format="%d")
+               for lab in LABELS},
+            "Hours": st.column_config.NumberColumn("Hours", min_value=0, max_value=12, step=0.5),
+            "Output": st.column_config.NumberColumn("Output", min_value=0),
+            "Unit": st.column_config.SelectboxColumn("Unit", options=UNITS),
+            "Remarks": st.column_config.TextColumn("Remarks"),
+        })
+    p2d = p2_edit.rename(columns={**dict(zip(LABELS, COLS)),
+                                  "Hours": "hours", "Output": "output_qty"})
+    p2d = p2d[p2d["Station"].notna()].copy()
+    p2d = to_num(p2d, COLS + ["hours", "output_qty"])
+    p2_mh = float(mh_part2(p2d).sum())
+    st.caption(f"Part 2: **{p2_mh:g}** man-hours")
+
+    # ---------- BALANCE ----------
+    st.subheader("Balance check (man-hours)")
+    not_alloc = avail_mh - p1_mh - p2_mh
+    m = st.columns(4)
+    m[0].metric("Available", f"{avail_mh:g}")
+    m[1].metric("Part 1", f"{p1_mh:g}")
+    m[2].metric("Part 2", f"{p2_mh:g}")
+    m[3].metric("Not allocated", f"{not_alloc:g}")
+    if abs(not_alloc) < 0.5:
+        st.success("✅ Balanced")
+    elif not_alloc > 0:
+        st.warning(f"⚠️ {not_alloc:g} man-hours not allocated")
+    else:
+        st.error(f"❌ {-not_alloc:g} man-hours over — someone may be counted twice")
+    over = [lab for c, lab in zip(COLS, LABELS) if p1_tot[c] > present[c]]
+    if over:
+        st.error("Part 1 has more people than present for: " + ", ".join(over))
+
+    # ---------- SAVE ----------
+    if st.button("💾 Save sheet", type="primary", width="stretch"):
+        errors = []
+        if sum(present.values()) == 0:
+            errors.append("Step 1: enter the people present")
+        for i, r in p2d.iterrows():
+            ppl = sum(r[c] for c in COLS)
+            if ppl > 0 and r["hours"] <= 0:
+                errors.append(f"Part 2 · {r['Station']}: enter hours")
+            if ppl == 0 and (r["hours"] > 0 or r["output_qty"] > 0):
+                errors.append(f"Part 2 · {r['Station']}: enter people")
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            user = st.session_state["user_name"]
+            day, sh = sel_date.isoformat(), sel_shift
+            rows = []
+            for _, r in p1d.iterrows():
+                if sum(r[c] for c in COLS) > 0:
+                    rows.append({"entry_date": day, "shift": sh, "part": 1,
+                                 "station": r["Station"],
+                                 **{c: int(r[c]) for c in COLS},
+                                 "entered_by": user})
+            for _, r in p2d.iterrows():
+                if sum(r[c] for c in COLS) > 0:
+                    unit = r.get("Unit")
+                    rem = r.get("Remarks")
+                    rows.append({"entry_date": day, "shift": sh, "part": 2,
+                                 "station": r["Station"],
+                                 **{c: int(r[c]) for c in COLS},
+                                 "hours": float(r["hours"]),
+                                 "output_qty": float(r["output_qty"]),
+                                 "output_unit": None if pd.isna(unit) else unit,
+                                 "remarks": None if pd.isna(rem) or not str(rem).strip()
+                                 else str(rem).strip(),
+                                 "entered_by": user})
+            try:
+                db.table(T_ALLOC).delete().eq("entry_date", day).eq("shift", sh).execute()
+                db.table(T_ATT).delete().eq("entry_date", day).eq("shift", sh).execute()
+                db.table(T_ATT).insert({"entry_date": day, "shift": sh,
+                                        **{c: int(present[c]) for c in COLS},
+                                        "entered_by": user}).execute()
+                if rows:
+                    db.table(T_ALLOC).insert(rows).execute()
+            except Exception as e:
+                st.error(f"Could not save: {e}")
             else:
-                try:
-                    for rid, data in updates:
-                        db.table(TABLE).update(data).eq("id", rid).execute()
-                    if to_delete:
-                        db.table(TABLE).delete().in_("id", to_delete).execute()
-                except Exception as e:
-                    st.error(f"Could not save: {e}")
-                else:
-                    st.session_state["edit_msg"] = (
-                        f"✅ Updated {len(updates)} row(s), deleted {len(to_delete)} row(s)")
-                    st.session_state["edit_ver"] += 1
-                    st.rerun()
+                st.session_state["save_msg"] = (
+                    f"✅ Saved {sel_shift} shift for {sel_date.strftime('%d-%m-%Y')}")
+                st.session_state["ver"] += 1
+                st.rerun()
 
-# ---------------- TAB 3: EXCEL ----------------
-with tab3:
+    if att:
+        with st.expander("🗑️ Delete this sheet"):
+            sure = st.checkbox("Yes, delete this date and shift completely",
+                               key=f"del_{k}")
+            if st.button("Delete", disabled=not sure, key=f"delbtn_{k}"):
+                day = sel_date.isoformat()
+                db.table(T_ALLOC).delete().eq("entry_date", day).eq("shift", sel_shift).execute()
+                db.table(T_ATT).delete().eq("entry_date", day).eq("shift", sel_shift).execute()
+                st.session_state["save_msg"] = "🗑️ Sheet deleted"
+                st.session_state["ver"] += 1
+                st.rerun()
+
+# ================= TAB 2: EXCEL =================
+with tab2:
     c1, c2 = st.columns(2)
     x_from = c1.date_input("From", today_ist().replace(day=1),
                            format="DD/MM/YYYY", key="x_from")
     x_to = c2.date_input("To", today_ist(), format="DD/MM/YYYY", key="x_to")
 
-    if st.button("📊 Prepare Excel", type="primary", use_container_width=True):
-        data = fetch(x_from, x_to)
-        if data.empty:
-            st.warning("No entries in this period.")
+    if st.button("📊 Prepare Excel", type="primary", width="stretch"):
+        a = fetch_range(T_ATT, x_from, x_to)
+        b = fetch_range(T_ALLOC, x_from, x_to)
+        if a.empty:
+            st.warning("No sheets saved in this period.")
             st.session_state.pop("xlsx", None)
         else:
-            st.session_state["xlsx"] = make_excel(data)
+            if b.empty:
+                b = pd.DataFrame(columns=["entry_date", "shift", "part", "station",
+                                          *COLS, "hours", "output_qty",
+                                          "output_unit", "remarks"])
+            st.session_state["xlsx"] = make_excel(a, b)
             st.session_state["xlsx_name"] = (
                 f"Manpower_{x_from.strftime('%d-%m-%Y')}_to_{x_to.strftime('%d-%m-%Y')}.xlsx")
 
@@ -332,7 +461,6 @@ with tab3:
             "⬇️ Download Excel", data=st.session_state["xlsx"],
             file_name=st.session_state["xlsx_name"],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-        st.caption("Sheets: Date Summary, Task Summary, All Data, "
-                   "plus one sheet for each date.")
+            width="stretch")
+        st.caption("Sheets: Daily Summary, Part 1 Stations, Part 2 Manual, "
+                   "Station Summary, plus one sheet for each date.")
